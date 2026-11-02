@@ -79,6 +79,49 @@ def read_one_file(uploaded_file, default_year: int):
         raise ValueError(f"文件 {uploaded_file.name} 中未找到有效数据。")
     return pd.concat(frames, ignore_index=True)
 
+def load_phone_map(uploaded_file):
+    """
+    读取电话匹配表，返回 {下单账号: 实际电话} 的字典。
+    规则：若【实际电话】内容含有 * 或 ＊（全角），则替换成空值。
+    """
+    if uploaded_file is None:
+        return {}
+    suffix = uploaded_file.name.lower().split(".")[-1]
+    engine = "xlrd" if suffix == "xls" else "openpyxl"
+
+    try:
+        sheets = pd.read_excel(uploaded_file, sheet_name=None, engine=engine)
+    except Exception:
+        uploaded_file.seek(0)
+        only = pd.read_excel(uploaded_file, engine=engine)
+        sheets = {"Sheet1": only}
+
+    phone_map = {}
+    for _, df in sheets.items():
+        if df is None or df.empty:
+            continue
+        df = df.copy()
+        df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
+
+        account_col = next((c for c in ["下单帐号", "下单账号"] if c in df.columns), None)
+        phone_col = next((c for c in ["实际电话", "联系电话", "电话"] if c in df.columns), None)
+        if account_col is None or phone_col is None:
+            continue
+
+        acc = df[account_col].astype(str).str.strip()
+        phone = df[phone_col].astype(str).str.strip()
+
+        # 含半角 * 或全角 ＊ 的视为脱敏，替换为空
+        has_star = phone.str.contains(r"[*＊]", regex=True, na=False)
+        phone = phone.where(~has_star, "")
+        # 字面 "nan" 也当空
+        phone = phone.where(phone.str.lower() != "nan", "")
+
+        valid = acc.notna() & (acc != "") & (acc.str.lower() != "nan")
+        for a, p in zip(acc[valid], phone[valid]):
+            phone_map[a] = p
+    return phone_map
+
 def build_final_table(raw: pd.DataFrame):
     """生成最终的账号月度对比单表，细化状态"""
     raw = raw.sort_values("月份")
@@ -96,16 +139,13 @@ def build_final_table(raw: pd.DataFrame):
     latest_period = max(available_periods)
     prev_period = latest_period - 1
 
-    # 提取最新月和上个月的数据
     curr_df = monthly_sum[monthly_sum["月份"] == latest_period][["下单账号", "订单金额"]].rename(columns={"订单金额": "本月金额"})
     prev_df = monthly_sum[monthly_sum["月份"] == prev_period][["下单账号", "订单金额"]].rename(columns={"订单金额": "上月金额"})
-    
-    # 找出在“上个月及以前”曾经下过单的所有历史账号（用于区分纯新和老客）
+
     past_periods = [p for p in available_periods if p <= prev_period]
     past_df = monthly_sum[monthly_sum["月份"].isin(past_periods)][["下单账号"]].drop_duplicates()
     past_df["历史有单"] = True
 
-    # 合并基础信息与对比数据（以基础信息为主表，确保流失的老客户也能显示出来）
     comp_df = base_info.merge(curr_df, on="下单账号", how="left")
     comp_df = comp_df.merge(prev_df, on="下单账号", how="left")
     comp_df = comp_df.merge(past_df, on="下单账号", how="left")
@@ -114,22 +154,17 @@ def build_final_table(raw: pd.DataFrame):
     comp_df["上月金额"] = comp_df["上月金额"].fillna(0)
     comp_df["历史有单"] = comp_df["历史有单"].fillna(False)
 
-    # 计算变化金额
     comp_df["变化金额"] = comp_df["本月金额"] - comp_df["上月金额"]
 
-    # 状态判定逻辑
     def get_status(row):
         curr = row["本月金额"]
         prev = row["上月金额"]
-        
-        # 如果没有上传上个月的数据，则无法对比
+
         if prev_period not in available_periods:
             return "无上月数据"
-            
+
         if prev == 0:
             if curr > 0:
-                # 以前有单，但上月为0 -> 老客回流（新增金额）
-                # 以前从来没单，本月有单 -> 全新账户（新增账户）
                 return "老客回流" if row["历史有单"] else "全新账户"
             else:
                 return "无单"
@@ -142,38 +177,40 @@ def build_final_table(raw: pd.DataFrame):
             return "持平"
 
     comp_df["状态"] = comp_df.apply(get_status, axis=1)
-    
+
     # 3. 合并宽表
     final_df = pd.merge(comp_df, pivot, on="下单账号", how="outer")
-    
-    # 重命名和整理列
+
     final_df = final_df.rename(columns={"上月金额": "上月下单金额", "本月金额": "本月下单金额"})
-    
-    # 把本月金额替换为对应的X月金额列名，避免冗余
+
     latest_month_col = f"{latest_period.month}月金额"
     if latest_month_col in final_df.columns:
         final_df = final_df.drop(columns=["本月下单金额"])
 
-    # 排序：有最新单的按金额降序，没单的排后面
     if latest_month_col in final_df.columns:
         final_df = final_df.sort_values(by=[latest_month_col, "上月下单金额"], ascending=[False, False])
 
-    # 整理列顺序（基础信息 -> 各月 -> 上月 -> 变化 -> 状态）
     cols = ["下单账号", "客户姓名", "实际电话", "地址"] + month_cols + ["上月下单金额", "变化金额", "状态"]
     final_df = final_df[[c for c in cols if c in final_df.columns]]
+    
+    final_df = final_df.reset_index(drop=True)
+
+    # ⭐️ 新增：全局兜底清理 —— 强制把主表中带有 * 或 ＊ 的电话替换为空
+    if "实际电话" in final_df.columns:
+        mask_star = final_df["实际电话"].astype(str).str.contains(r"[*＊]", regex=True, na=False)
+        final_df.loc[mask_star, "实际电话"] = ""
 
     return final_df, month_cols, latest_period
 
 def style_final_row(row):
-    """为表格整行上色，细化颜色"""
     status = row["状态"]
     color = ""
-    if status == "全新账户": color = "#FFD966"       # 深黄色：纯新账户
-    elif status == "老客回流": color = "#FFF2CC"     # 浅黄色：老号回流（新增金额）
-    elif status == "增加": color = "#E2EFDA"         # 浅绿色
-    elif status == "减少": color = "#FCE4D6"         # 浅红色
-    elif status == "流失": color = "#F4B084"         # 橙红色
-    elif status == "无上月数据": color = "#F2F2F2"   # 灰色
+    if status == "全新账户": color = "#FFD966"
+    elif status == "老客回流": color = "#FFF2CC"
+    elif status == "增加": color = "#E2EFDA"
+    elif status == "减少": color = "#FCE4D6"
+    elif status == "流失": color = "#F4B084"
+    elif status == "无上月数据": color = "#F2F2F2"
     return [f"background-color: {color}" if color else "" for _ in row]
 
 def to_excel_bytes(final_df):
@@ -186,7 +223,7 @@ def to_excel_bytes(final_df):
 
         headers = {cell.value: cell.column for cell in ws[1]}
         status_col = headers["状态"]
-        
+
         fills = {
             "全新账户": PatternFill(fill_type="solid", start_color="FFD966", end_color="FFD966"),
             "老客回流": PatternFill(fill_type="solid", start_color="FFF2CC", end_color="FFF2CC"),
@@ -195,8 +232,7 @@ def to_excel_bytes(final_df):
             "流失": PatternFill(fill_type="solid", start_color="F4B084", end_color="F4B084"),
             "无上月数据": PatternFill(fill_type="solid", start_color="F2F2F2", end_color="F2F2F2"),
         }
-        
-        # 整行涂色
+
         for row in range(2, ws.max_row + 1):
             status = ws.cell(row=row, column=status_col).value
             fill = fills.get(status)
@@ -204,15 +240,12 @@ def to_excel_bytes(final_df):
                 for col in range(1, ws.max_column + 1):
                     ws.cell(row=row, column=col).fill = fill
 
-        # 列宽设置
         for col in range(1, ws.max_column + 1):
             col_name = get_column_letter(col)
             ws.column_dimensions[col_name].width = 15
-            
-        # 冻结窗格：冻结前 5 列和第一行
+
         ws.freeze_panes = "E2"
-        
-        # 金额格式化
+
         for col_name, col_idx in headers.items():
             if "金额" in str(col_name):
                 for row in range(2, ws.max_row + 1):
@@ -241,11 +274,16 @@ with st.sidebar:
         <div style='background-color:#E2EFDA; padding:5px; margin-bottom:5px; border-radius:4px; color:black;'><b>浅绿色</b>：正常增加</div>
         <div style='background-color:#FCE4D6; padding:5px; margin-bottom:5px; border-radius:4px; color:black;'><b>浅红色</b>：正常减少</div>
         <div style='background-color:#F4B084; padding:5px; margin-bottom:5px; border-radius:4px; color:black;'><b>橙红色</b>：流失（上月有单，本月归零）</div>
-        """, 
+        """,
         unsafe_allow_html=True
     )
 
-uploaded_files = st.file_uploader("上传 Excel 文件，可一次选择多个月份", type=["xls", "xlsx"], accept_multiple_files=True)
+uploaded_files = st.file_uploader("上传月度 Excel 文件，可一次选择多个月份", type=["xls", "xlsx"], accept_multiple_files=True)
+phone_file = st.file_uploader(
+    "（可选）上传【电话匹配表】，需包含【下单账号】【客户姓名】【实际电话】三列，"
+    "将按账号覆盖主表中的实际电话；包含 * 的电话会自动清空。",
+    type=["xls", "xlsx"],
+)
 
 if uploaded_files:
     all_rows = []
@@ -258,11 +296,38 @@ if uploaded_files:
 
     if all_rows:
         raw = pd.concat(all_rows, ignore_index=True)
-        
         final_df, month_cols, latest_period = build_final_table(raw)
 
+        # ---------- 应用电话匹配 ----------
+        if phone_file is not None:
+            try:
+                phone_map = load_phone_map(phone_file)
+            except Exception as e:
+                st.warning(f"电话匹配表读取失败：{e}")
+                phone_map = {}
+
+            if phone_map:
+                acc_series = final_df["下单账号"].astype(str).str.strip()
+                matched = acc_series.map(phone_map)
+                updated_mask = matched.notna()
+                if updated_mask.any():
+                    final_df.loc[updated_mask, "实际电话"] = matched[updated_mask]
+                    st.success(
+                        f"✅ 已按电话匹配表更新 {int(updated_mask.sum())} 个账号的【实际电话】"
+                        f"（含 * 的已置空）。"
+                    )
+                else:
+                    st.info("电话匹配表中未找到匹配的【下单账号】。")
+            else:
+                st.info("电话匹配表未读取到有效数据（需含【下单账号】【实际电话】列）。")
+
+        # ⭐️ 再次兜底：防止匹配表的内容里混入星号（双重保险）
+        if "实际电话" in final_df.columns:
+            mask_star = final_df["实际电话"].astype(str).str.contains(r"[*＊]", regex=True, na=False)
+            final_df.loc[mask_star, "实际电话"] = ""
+
         st.subheader(f"账号月度对比 (对比月份: {latest_period})")
-        
+
         format_dict = {col: "{:,.2f}" for col in month_cols}
         format_dict.update({"上月下单金额": "{:,.2f}", "变化金额": "{:,.2f}"})
 
