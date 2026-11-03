@@ -13,6 +13,19 @@ st.set_page_config(
     layout="wide",
 )
 
+# 匹配表可提供的列（按顺序用于替换主表）
+MATCH_COLS = ["客户姓名", "实际电话", "省份", "地级市", "区县", "地址"]
+
+# 匹配表列名可能出现的别名
+MATCH_COL_CANDIDATES = {
+    "客户姓名": ["客户姓名", "姓名"],
+    "实际电话": ["实际电话", "联系电话", "电话"],
+    "省份": ["省份", "省"],
+    "地级市": ["地级市", "市", "城市"],
+    "区县": ["区县", "区", "县"],
+    "地址": ["地址", "客户地址"],
+}
+
 # ---------------- 数据读取与处理 ----------------
 
 def parse_year_month(filename: str, default_year: int):
@@ -44,7 +57,7 @@ def read_one_file(uploaded_file, default_year: int):
     for sheet_name, df in sheets.items():
         if df is None or df.empty:
             continue
-        
+
         df = df.copy()
         df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
 
@@ -55,7 +68,7 @@ def read_one_file(uploaded_file, default_year: int):
         name_col = next((c for c in ["客户姓名", "姓名"] if c in df.columns), None)
         phone_col = next((c for c in ["实际电话", "联系电话", "电话"] if c in df.columns), None)
         addr_col = next((c for c in ["地址", "客户地址"] if c in df.columns), None)
-        
+
         out = pd.DataFrame()
         out["下单账号"] = df[account_col].astype(str).str.strip()
         out["订单金额"] = pd.to_numeric(
@@ -65,10 +78,10 @@ def read_one_file(uploaded_file, default_year: int):
         out["客户姓名"] = df[name_col].astype(str).str.strip() if name_col else ""
         out["实际电话"] = df[phone_col].astype(str).str.strip() if phone_col else ""
         out["地址"] = df[addr_col].astype(str).str.strip() if addr_col else ""
-        
+
         mask = out["下单账号"].notna() & (out["下单账号"] != "") & (out["下单账号"].str.lower() != "nan") & out["订单金额"].notna()
         out = out[mask]
-        
+
         if out.empty:
             continue
 
@@ -79,13 +92,14 @@ def read_one_file(uploaded_file, default_year: int):
         raise ValueError(f"文件 {uploaded_file.name} 中未找到有效数据。")
     return pd.concat(frames, ignore_index=True)
 
-def load_phone_map(uploaded_file):
+def load_match_map(uploaded_file):
     """
-    读取电话匹配表，返回 {下单账号: 实际电话} 的字典。
-    规则：若【实际电话】内容含有 * 或 ＊（全角），则替换成空值。
+    读取匹配表，返回 {下单账号: {客户姓名, 实际电话, 省份, 地级市, 区县, 地址}} 的字典。
+    规则：若【实际电话】内容含有 * 或 ＊（全角），则替换为空值。
     """
     if uploaded_file is None:
         return {}
+
     suffix = uploaded_file.name.lower().split(".")[-1]
     engine = "xlrd" if suffix == "xls" else "openpyxl"
 
@@ -96,31 +110,55 @@ def load_phone_map(uploaded_file):
         only = pd.read_excel(uploaded_file, engine=engine)
         sheets = {"Sheet1": only}
 
-    phone_map = {}
+    match_map = {}
     for _, df in sheets.items():
         if df is None or df.empty:
             continue
+
         df = df.copy()
         df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
 
         account_col = next((c for c in ["下单帐号", "下单账号"] if c in df.columns), None)
-        phone_col = next((c for c in ["实际电话", "联系电话", "电话"] if c in df.columns), None)
-        if account_col is None or phone_col is None:
+        if account_col is None:
             continue
 
-        acc = df[account_col].astype(str).str.strip()
-        phone = df[phone_col].astype(str).str.strip()
+        # 解析每个目标列在匹配表中的实际列名
+        resolved = {}
+        for target, candidates in MATCH_COL_CANDIDATES.items():
+            resolved[target] = next((c for c in candidates if c in df.columns), None)
 
-        # 含半角 * 或全角 ＊ 的视为脱敏，替换为空
-        has_star = phone.str.contains(r"[*＊]", regex=True, na=False)
-        phone = phone.where(~has_star, "")
-        # 字面 "nan" 也当空
-        phone = phone.where(phone.str.lower() != "nan", "")
+        # 至少要有一列可用信息
+        if all(v is None for v in resolved.values()):
+            continue
 
-        valid = acc.notna() & (acc != "") & (acc.str.lower() != "nan")
-        for a, p in zip(acc[valid], phone[valid]):
-            phone_map[a] = p
-    return phone_map
+        for _, row in df.iterrows():
+            acc = row[account_col]
+            if pd.isna(acc):
+                continue
+            acc = str(acc).strip()
+            if not acc or acc.lower() == "nan":
+                continue
+
+            info = {}
+            for target, src in resolved.items():
+                if src is None:
+                    continue
+                v = row[src]
+                if pd.isna(v):
+                    v = ""
+                else:
+                    v = str(v).strip()
+                    if v.lower() == "nan":
+                        v = ""
+                info[target] = v
+
+            # 电话中含 * 或 ＊ 一律置空
+            if "实际电话" in info and re.search(r"[*＊]", info["实际电话"]):
+                info["实际电话"] = ""
+
+            match_map[acc] = info
+
+    return match_map
 
 def build_final_table(raw: pd.DataFrame):
     """生成最终的账号月度对比单表，细化状态"""
@@ -190,12 +228,21 @@ def build_final_table(raw: pd.DataFrame):
     if latest_month_col in final_df.columns:
         final_df = final_df.sort_values(by=[latest_month_col, "上月下单金额"], ascending=[False, False])
 
-    cols = ["下单账号", "客户姓名", "实际电话", "地址"] + month_cols + ["上月下单金额", "变化金额", "状态"]
-    final_df = final_df[[c for c in cols if c in final_df.columns]]
-    
+    # 确保匹配列存在于最终表（无则补空）
+    for c in ["省份", "地级市", "区县"]:
+        if c not in final_df.columns:
+            final_df[c] = ""
+
+    ordered_cols = (
+        ["下单账号", "客户姓名", "实际电话", "省份", "地级市", "区县", "地址"]
+        + month_cols
+        + ["上月下单金额", "变化金额", "状态"]
+    )
+    final_df = final_df[[c for c in ordered_cols if c in final_df.columns]]
+
     final_df = final_df.reset_index(drop=True)
 
-    # ⭐️ 新增：全局兜底清理 —— 强制把主表中带有 * 或 ＊ 的电话替换为空
+    # ⭐️ 全局兜底清理：强制把主表中带有 * 或 ＊ 的电话替换为空
     if "实际电话" in final_df.columns:
         mask_star = final_df["实际电话"].astype(str).str.contains(r"[*＊]", regex=True, na=False)
         final_df.loc[mask_star, "实际电话"] = ""
@@ -240,9 +287,19 @@ def to_excel_bytes(final_df):
                 for col in range(1, ws.max_column + 1):
                     ws.cell(row=row, column=col).fill = fill
 
-        for col in range(1, ws.max_column + 1):
-            col_name = get_column_letter(col)
-            ws.column_dimensions[col_name].width = 15
+        # 列宽优化
+        width_map = {
+            "下单账号": 22,
+            "客户姓名": 12,
+            "实际电话": 16,
+            "省份": 10,
+            "地级市": 12,
+            "区县": 12,
+            "地址": 32,
+            "状态": 12,
+        }
+        for col_name, col_idx in headers.items():
+            ws.column_dimensions[get_column_letter(col_idx)].width = width_map.get(str(col_name), 15)
 
         ws.freeze_panes = "E2"
 
@@ -264,7 +321,7 @@ with st.sidebar:
     default_year = st.number_input(
         "文件名只有“X月”时，使用的年份", min_value=2000, max_value=2100, value=datetime.date.today().year, step=1
     )
-    
+
     st.markdown("---")
     st.markdown("### 颜色图例说明")
     st.markdown(
@@ -275,13 +332,16 @@ with st.sidebar:
         <div style='background-color:#FCE4D6; padding:5px; margin-bottom:5px; border-radius:4px; color:black;'><b>浅红色</b>：正常减少</div>
         <div style='background-color:#F4B084; padding:5px; margin-bottom:5px; border-radius:4px; color:black;'><b>橙红色</b>：流失（上月有单，本月归零）</div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
-uploaded_files = st.file_uploader("上传月度 Excel 文件，可一次选择多个月份", type=["xls", "xlsx"], accept_multiple_files=True)
-phone_file = st.file_uploader(
-    "（可选）上传【电话匹配表】，需包含【下单账号】【客户姓名】【实际电话】三列，"
-    "将按账号覆盖主表中的实际电话；包含 * 的电话会自动清空。",
+uploaded_files = st.file_uploader(
+    "上传月度 Excel 文件，可一次选择多个月份", type=["xls", "xlsx"], accept_multiple_files=True
+)
+match_file = st.file_uploader(
+    "（可选）上传【信息匹配表】，需包含【下单账号】列，可包含"
+    "【客户姓名】【实际电话】【省份】【地级市】【区县】【地址】列；"
+    "匹配表中存在的列将按账号覆盖主表；【实际电话】含 * 或 ＊ 的会自动置空。",
     type=["xls", "xlsx"],
 )
 
@@ -298,28 +358,38 @@ if uploaded_files:
         raw = pd.concat(all_rows, ignore_index=True)
         final_df, month_cols, latest_period = build_final_table(raw)
 
-        # ---------- 应用电话匹配 ----------
-        if phone_file is not None:
+        # ---------- 应用匹配表 ----------
+        if match_file is not None:
             try:
-                phone_map = load_phone_map(phone_file)
+                match_map = load_match_map(match_file)
             except Exception as e:
-                st.warning(f"电话匹配表读取失败：{e}")
-                phone_map = {}
+                st.warning(f"匹配表读取失败：{e}")
+                match_map = {}
 
-            if phone_map:
+            if match_map:
                 acc_series = final_df["下单账号"].astype(str).str.strip()
-                matched = acc_series.map(phone_map)
-                updated_mask = matched.notna()
-                if updated_mask.any():
-                    final_df.loc[updated_mask, "实际电话"] = matched[updated_mask]
+                matched_acc = 0
+                field_hits = {c: 0 for c in MATCH_COLS}
+
+                for acc, info in match_map.items():
+                    mask = acc_series == acc
+                    if not mask.any():
+                        continue
+                    matched_acc += int(mask.sum())
+                    for col, val in info.items():
+                        if col in final_df.columns:
+                            final_df.loc[mask, col] = val
+                            field_hits[col] += int(mask.sum())
+
+                if matched_acc > 0:
+                    hit_desc = "、".join(f"{c}×{n}" for c, n in field_hits.items() if n > 0) or "无字段"
                     st.success(
-                        f"✅ 已按电话匹配表更新 {int(updated_mask.sum())} 个账号的【实际电话】"
-                        f"（含 * 的已置空）。"
+                        f"✅ 已按匹配表更新 {matched_acc} 个账号的字段（{hit_desc}），含 * 的电话已置空。"
                     )
                 else:
-                    st.info("电话匹配表中未找到匹配的【下单账号】。")
+                    st.info("匹配表中未找到匹配的【下单账号】。")
             else:
-                st.info("电话匹配表未读取到有效数据（需含【下单账号】【实际电话】列）。")
+                st.info("匹配表未读取到有效数据（需含【下单账号】列且至少有一列可用信息）。")
 
         # ⭐️ 再次兜底：防止匹配表的内容里混入星号（双重保险）
         if "实际电话" in final_df.columns:
